@@ -13,18 +13,38 @@ export function UploadForm({ onUploadSuccess }: UploadFormProps) {
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
+      console.log('File selected:', e.target.files[0]);
       setFile(e.target.files[0]);
+      console.log('File state updated');
     }
   };
 
   const handleUpload = async () => {
+    console.log('handleUpload called, file:', file);
     if (!file) return;
 
     setUploading(true);
     try {
+      console.log('Starting upload with file:', {
+        name: file.name,
+        type: file.type,
+        size: file.size
+      });
+
       const formData = new FormData();
       formData.append('file', file);
+      
+      // Log FormData contents
+      console.log('FormData entries:');
+      for (let [key, value] of formData.entries()) {
+        console.log('Key:', key, 'Value:', {
+          name: value instanceof File ? value.name : 'not a file',
+          type: value instanceof File ? value.type : typeof value,
+          size: value instanceof File ? value.size : 'N/A'
+        });
+      }
 
+      console.log('Sending request to:', `${import.meta.env.VITE_API_URL}/api/upload-video`);
       const response = await fetch(`${import.meta.env.VITE_API_URL}/api/upload-video`, {
         method: 'POST',
         body: formData,
@@ -51,6 +71,10 @@ export function UploadForm({ onUploadSuccess }: UploadFormProps) {
   };
 
   const fileInputRef = React.useRef<HTMLInputElement>(null);
+
+  React.useEffect(() => {
+    console.log('File state changed:', file);
+  }, [file]);
 
   return (
     <Card className="w-full max-w-md mx-auto">
