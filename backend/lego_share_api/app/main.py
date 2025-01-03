@@ -39,7 +39,7 @@ app = FastAPI()
 # Disable CORS. Do not remove this for full-stack development.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["https://lego-share-app-hchp0479.devinapps.com"],  # Allow frontend domain
     allow_credentials=True,
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
