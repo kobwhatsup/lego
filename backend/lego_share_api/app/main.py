@@ -1,7 +1,7 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-import psycopg
+from sqlalchemy.orm import Session
 import os
 import uuid
 from pathlib import Path
@@ -17,8 +17,14 @@ from .models import (
     CreationCreate,
     Comment,
     CommentCreate,
-    Rating
+    Rating,
+    # Database models
+    DBCreation,
+    DBComment,
+    DBRating,
+    DBCreationImage
 )
+from .database import get_db, engine, Base
 from .services import process_video
 
 # Configure logging
@@ -29,6 +35,9 @@ load_dotenv()
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/tmp/lego-share/uploads")
 MODEL_OUTPUT_DIR = os.getenv("MODEL_OUTPUT_DIR", "/tmp/lego-share/models")
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", 100_000_000))  # 100MB default
+
+# Create database tables
+Base.metadata.create_all(bind=engine)
 
 # Ensure directories exist
 Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
@@ -49,55 +58,107 @@ app.add_middleware(
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 app.mount("/models", StaticFiles(directory=MODEL_OUTPUT_DIR), name="models")
 
-# In-memory storage
-creations: dict[str, Creation] = {}
-comments: dict[str, list[Comment]] = {}
-ratings: dict[str, dict[str, int]] = {}
+# No need for in-memory storage as we're using database now
 
 @app.get("/api/creations", response_model=list[Creation])
-async def list_creations():
-    return list(creations.values())
+async def list_creations(db: Session = Depends(get_db)):
+    db_creations = db.query(DBCreation).all()
+    return [
+        Creation(
+            id=creation.id,
+            title=creation.title,
+            author=creation.author,
+            video_url=creation.video_url,
+            images=[img.image_url for img in creation.images],
+            model_url=creation.model_url,
+            likes=creation.likes,
+            comments=[
+                Comment(
+                    id=comment.id,
+                    creation_id=comment.creation_id,
+                    author=comment.author,
+                    content=comment.content,
+                    created_at=comment.created_at
+                ) for comment in creation.comments
+            ],
+            created_at=creation.created_at
+        ) for creation in db_creations
+    ]
 
 @app.post("/api/creations/{creation_id}/comments", response_model=Comment)
-async def add_comment(creation_id: str, comment: CommentCreate):
-    if creation_id not in creations:
+async def add_comment(creation_id: str, comment: CommentCreate, db: Session = Depends(get_db)):
+    db_creation = db.query(DBCreation).filter(DBCreation.id == creation_id).first()
+    if not db_creation:
         raise HTTPException(status_code=404, detail="Creation not found")
     
     comment_id = str(uuid.uuid4())
-    new_comment = Comment(
+    db_comment = DBComment(
         id=comment_id,
         creation_id=creation_id,
         author=comment.author,
         content=comment.content,
-        created_at=datetime.now()
+        created_at=datetime.utcnow()
     )
     
-    if creation_id not in comments:
-        comments[creation_id] = []
-    comments[creation_id].append(new_comment)
-    return new_comment
+    db.add(db_comment)
+    db.commit()
+    db.refresh(db_comment)
+    
+    return Comment(
+        id=db_comment.id,
+        creation_id=db_comment.creation_id,
+        author=db_comment.author,
+        content=db_comment.content,
+        created_at=db_comment.created_at
+    )
 
 @app.get("/api/creations/{creation_id}/comments", response_model=list[Comment])
-async def get_comments(creation_id: str):
-    if creation_id not in creations:
+async def get_comments(creation_id: str, db: Session = Depends(get_db)):
+    db_creation = db.query(DBCreation).filter(DBCreation.id == creation_id).first()
+    if not db_creation:
         raise HTTPException(status_code=404, detail="Creation not found")
-    return comments.get(creation_id, [])
+    
+    return [
+        Comment(
+            id=comment.id,
+            creation_id=comment.creation_id,
+            author=comment.author,
+            content=comment.content,
+            created_at=comment.created_at
+        ) for comment in db_creation.comments
+    ]
 
 @app.post("/api/creations/{creation_id}/rate")
-async def rate_creation(creation_id: str, rating: Rating):
-    if creation_id not in creations:
+async def rate_creation(creation_id: str, rating: Rating, db: Session = Depends(get_db)):
+    db_creation = db.query(DBCreation).filter(DBCreation.id == creation_id).first()
+    if not db_creation:
         raise HTTPException(status_code=404, detail="Creation not found")
     
-    if creation_id not in ratings:
-        ratings[creation_id] = {}
+    # Check if user has already rated this creation
+    existing_rating = db.query(DBRating).filter(
+        DBRating.creation_id == creation_id,
+        DBRating.user_id == rating.user_id
+    ).first()
     
+    if existing_rating:
+        existing_rating.score = rating.score
+    else:
+        db_rating = DBRating(
+            id=str(uuid.uuid4()),
+            creation_id=creation_id,
+            user_id=rating.user_id,
+            score=rating.score
+        )
+        db.add(db_rating)
     
-    # Store the user's rating
-    ratings[creation_id][rating.user_id] = rating.score
+    # Update creation's like count (ratings >= 4 count as likes)
+    like_count = db.query(DBRating).filter(
+        DBRating.creation_id == creation_id,
+        DBRating.score >= 4
+    ).count()
     
-    # Update the creation's like count (for now, we'll count ratings >= 4 as likes)
-    like_count = sum(1 for score in ratings[creation_id].values() if score >= 4)
-    creations[creation_id].likes = like_count
+    db_creation.likes = like_count
+    db.commit()
     
     return {"message": "Rating submitted successfully"}
 
@@ -170,20 +231,31 @@ async def get_processing_status(video_id: str):
         progress = 1.0
         
         # Create a Creation object if it doesn't exist yet
-        if video_id not in creations:
-            creation = Creation(
+        db = next(get_db())
+        db_creation = db.query(DBCreation).filter(DBCreation.id == video_id).first()
+        if not db_creation:
+            db_creation = DBCreation(
                 id=video_id,
                 title=f"LEGO Creation {video_id[:8]}",  # Default title
                 author="Anonymous",  # Default author
                 video_url=video_url,
-                images=sorted(images) if images else [],
                 model_url=f"/models/{video_id}.obj",
                 likes=0,
-                created_at=datetime.now()
+                created_at=datetime.utcnow()
             )
-            creations[video_id] = creation
-            comments[video_id] = []  # Initialize empty comments list
-            ratings[video_id] = {}   # Initialize empty ratings dict
+            db.add(db_creation)
+            
+            # Add images
+            for idx, image_url in enumerate(sorted(images) if images else []):
+                db_image = DBCreationImage(
+                    id=str(uuid.uuid4()),
+                    creation_id=video_id,
+                    image_url=image_url,
+                    order=idx
+                )
+                db.add(db_image)
+            
+            db.commit()
     elif images:
         status = "processing"
         progress = 0.5
